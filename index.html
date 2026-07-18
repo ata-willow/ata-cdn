@@ -15,7 +15,6 @@
   <link rel="apple-touch-icon" href="https://ata-willow.github.io/ata-cdn/icons/icon-192.png">
   <link rel="icon" type="image/png" href="https://ata-willow.github.io/ata-cdn/icons/icon-192.png">
   <title>Ata - Learning Assistant</title>
-  <base href="https://atahelp.pythonanywhere.com/">
   <link rel="preload" href="https://ata-willow.github.io/ata-cdn/static/css/style2.min.css?v=1784362920" as="style">
   <link rel="stylesheet" href="https://ata-willow.github.io/ata-cdn/static/css/style2.min.css?v=1784362920">
 </head>
@@ -26,12 +25,16 @@
     </div>
   </div>
   <script>
-    // Register service worker for PWA support
+    // Force unregister all service workers
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js', { scope: './' }).then(function(reg) {
-        console.log('SW registered, scope:', reg.scope);
-      }).catch(function(err) {
-        console.warn('SW registration failed:', err);
+      navigator.serviceWorker.getRegistrations().then(function(regs) {
+        regs.forEach(function(reg) { reg.unregister(); });
+      });
+    }
+    // Clear all caches
+    if ('caches' in window) {
+      caches.keys().then(function(keys) {
+        keys.forEach(function(key) { caches.delete(key); });
       });
     }
     // Global error handler
