@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Ata">
+  <meta name="theme-color" content="#FAF8F5">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="icon" type="image/png" href="/icons/icon-192.png">
+  <title>Ata - Learning Assistant</title>
+  <link rel="preload" href="https://ata-willow.github.io/ata-cdn/static/css/style2.min.css?v=1784352591" as="style">
+  <link rel="stylesheet" href="https://ata-willow.github.io/ata-cdn/static/css/style2.min.css?v=1784352591">
+</head>
+<body>
+  <div id="app">
+    <div style="padding:40px;text-align:center;color:#666;">
+      <p>⏳ 正在加载 Ata...</p>
+    </div>
+  </div>
+  <script>
+    // Force unregister all service workers
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(regs) {
+        regs.forEach(function(reg) { reg.unregister(); });
+      });
+    }
+    // Clear all caches
+    if ('caches' in window) {
+      caches.keys().then(function(keys) {
+        keys.forEach(function(key) { caches.delete(key); });
+      });
+    }
+    // Global error handler
+    window.onerror = function(msg, url, line, col, error) {
+      document.getElementById('app').innerHTML = '<div style="padding:20px;color:red;">JS错误: ' + msg + '<br>' + url + ':' + line + '<br><pre>' + (error && error.stack ? error.stack : '') + '</pre></div>';
+      return false;
+    };
+    window.onunhandledrejection = function(e) {
+      document.getElementById('app').innerHTML = '<div style="padding:20px;color:red;">Promise错误: ' + e.reason + '<br><pre>' + (e.reason && e.reason.stack ? e.reason.stack : '') + '</pre></div>';
+    };
+  </script>
+  <script src="https://ata-willow.github.io/ata-cdn/static/js/chunk1.min.js?v=1784352591" defer></script>
+  <script src="https://ata-willow.github.io/ata-cdn/static/js/chunk2a.min.js?v=1784352591" defer></script>
+  <script src="https://ata-willow.github.io/ata-cdn/static/js/chunk2b.min.js?v=1784352591" defer></script>
+  <script src="https://ata-willow.github.io/ata-cdn/static/js/chunk3.min.js?v=1784352591" defer></script>
+</body>
+</html>
