@@ -71,6 +71,22 @@ let _tagsByChapterCache = {}; // cached tags by chapter_id: { chapterId: [tag1, 
 let _mistakesPageCache = {}; // { cacheKey: { data, timestamp } }
 const _MISTAKES_PAGE_CACHE_TTL = 15000; // 15 seconds
 
+// --- Exam Week Mode State ---
+let _examMode = 'daily';        // 'daily' | 'comprehensive' | 'custom'
+let _examIntensity = 'full';    // 'full' | 'light'
+let _examSubjectId = null;      // selected subject for exam
+let _examChapterIds = [];       // selected chapter ids for custom mode
+let _examSession = null;        // current exam session object
+let _examAnswers = {};          // { questionId: answer }
+let _examCurrentQ = 0;          // current question index (0-based)
+let _examTimer = null;          // setInterval ID
+let _examSeconds = 0;           // elapsed seconds
+let _examTimerVisible = true;   // toggle timer visibility
+let _examResult = null;         // result from submit
+let _examHistory = [];          // past exam sessions list
+let _examStats = null;          // exam dashboard stats
+let _examReviewQuestion = null; // current question being reviewed
+
 async function loadAllTags() {
   try {
     const data = await API.get('/api/tags');
@@ -322,6 +338,11 @@ async function navigate(page, data = {}) {
     window.scrollTo(0, 0);
     if (['home', 'subjects', 'mistakes', 'quizzes', 'chapters', 'chapter-quizzes', 'add-mistake', 'add-quiz', 'edit-quiz', 'settings', 'batch-mistakes'].includes(page)) {
       await loadPageData();
+    }
+    // Clean up exam timer when leaving exam-taking page
+    if (page !== 'exam-taking' && _examTimer) {
+      clearInterval(_examTimer);
+      _examTimer = null;
     }
   } catch(e) {
     console.error('navigate error:', e);
@@ -834,9 +855,15 @@ function render() {
       case 'settings': html = renderSettings(); break;
       case 'trash': html = renderTrash(); break;
       case 'batch-mistakes': html = renderBatchMistakes(); break;
+      case 'exam': html = renderExam(); break;
+      case 'exam-taking': html = renderExamTaking(); break;
+      case 'exam-result': html = renderExamResult(); break;
+      case 'exam-review': html = renderExamReview(); break;
+      case 'exam-history': html = renderExamHistory(); break;
+      case 'exam-dashboard': html = renderExamDashboard(); break;
       default: html = renderHome();
     }
-    if (!['take-quiz', 'quiz-result', 'edit-quiz'].includes(state.currentPage)) {
+    if (!['take-quiz', 'quiz-result', 'edit-quiz', 'exam-taking', 'exam-result', 'exam-review'].includes(state.currentPage)) {
       html += renderBottomNav();
     }
   }
@@ -847,6 +874,19 @@ function render() {
   if (state.currentPage === 'take-quiz' && state.currentQuiz) {
     updateSymbolBars(state.currentQuiz.subject_id || 0);
     // DEBUG removed - truncation fixed
+  }
+  // Load exam subjects when on exam page
+  if (state.currentPage === 'exam') {
+    loadExamSubjects();
+    updateSymbolBars(_examSubjectId || 0);
+  }
+  // Initialize symbol bars for exam-taking page
+  if (state.currentPage === 'exam-taking' && _examSession) {
+    updateSymbolBars(_examSession.subject_id || 0);
+  }
+  // Initialize symbol bars for exam-review page
+  if (state.currentPage === 'exam-review') {
+    updateSymbolBars(_examSubjectId || 0);
   }
 }
 
@@ -913,6 +953,10 @@ function renderHome() {
         <button class="btn btn-primary btn-sm" data-action="nav-subjects" style="flex:1;">📚 Subjects</button>
         <button class="btn btn-secondary btn-sm" data-action="nav-mistakes" style="flex:1;">📝 Mistakes</button>
         <button class="btn btn-secondary btn-sm" data-action="nav-quizzes" style="flex:1;">🧪 Quizzes</button>
+      </div>
+
+      <div style="margin-bottom:20px;">
+        <button class="btn btn-outline btn-sm" data-action="nav-exam" style="font-size:0.8rem;padding:6px 14px;">📝 考试周</button>
       </div>
 
       <div class="section-header">
@@ -1378,12 +1422,14 @@ D. 15
 标签：质数与合数</pre>
               </div>
               <p>系统会自动识别题型（有ABCD选项→选择题，否则→填空题）。</p>
-              <p><b>多小题大题：</b>在一道题内用 (a) (b) (c) 或 (1) (2) (3) 标记小题，每个小题单独写答案。</p>
+              <p><b>多小题大题：</b>在一道题内用 (a) (b) (c) 或 (1) (2) (3) 标记小题，每个小题单独写答案。每个小题可单独指定章节。</p>
               <pre>1. 物体从静止开始做匀加速直线运动，加速度为2m/s²，求：
 (a) 3秒后的速度
 答案：6m/s
+章节：运动的描述
 (b) 3秒内的位移
 答案：9m
+章节：匀变速直线运动
 (c) 第3秒内的位移
 答案：5m
 标签：匀加速直线运动</pre>
@@ -1584,6 +1630,7 @@ function parseQuestionBlock(block) {
           let subWrongAnswer = '';
           let subErrorReason = '';
           let subTags = '';
+          let subChapter = '';
           let subQuestionText = subText;
           
           // Extract 错因
@@ -1603,6 +1650,7 @@ function parseQuestionBlock(block) {
           // Extract 章节
           const chapMatch = subText.match(/\s*章节[：:]\s*(.+?)(?=\s*(?:错因|标签|答案|我写|我的|错误答案|我答)\s*[：:]|$)/i);
           if (chapMatch) {
+            subChapter = chapMatch[1].trim();
             subQuestionText = subQuestionText.replace(chapMatch[0], '').trim();
           }
           
@@ -1626,7 +1674,8 @@ function parseQuestionBlock(block) {
             correct: subAnswer,
             wrong_answer: subWrongAnswer,
             error_reason: subErrorReason,
-            tags: subTags
+            tags: subTags,
+            chapter: subChapter
           });
         }
         
@@ -1667,10 +1716,12 @@ function parseQuestionBlock(block) {
       let subWrongAnswer = '';
       let subErrorReason = '';
       let subTags = '';
+      let subChapter = '';
       let subAnswerIdx = -1;
       let subWrongIdx = -1;
       let subErtIdx = -1;
       let subTagIdx = -1;
+      let subChapIdx = -1;
       
       for (let j = subLines.length - 1; j >= 0; j--) {
         const line = subLines[j];
@@ -1690,10 +1741,14 @@ function parseQuestionBlock(block) {
           const tMatch = line.match(/^\s*标签[：:]\s*(.+)/i);
           if (tMatch) { subTags = tMatch[1].trim(); subTagIdx = j; continue; }
         }
+        if (subChapIdx < 0) {
+          const chMatch = line.match(/^\s*章节[：:]\s*(.+)/i);
+          if (chMatch) { subChapter = chMatch[1].trim(); subChapIdx = j; continue; }
+        }
       }
       
-      // Question text = lines before any metadata (answer/wrong/ert/tags)
-      const metaIndices = [subAnswerIdx, subWrongIdx, subErtIdx, subTagIdx].filter(x => x >= 0);
+      // Question text = lines before any metadata (answer/wrong/ert/tags/chapter)
+      const metaIndices = [subAnswerIdx, subWrongIdx, subErtIdx, subTagIdx, subChapIdx].filter(x => x >= 0);
       const firstMetaIdx = metaIndices.length > 0 ? Math.min(...metaIndices) : subLines.length;
       const subQLines = subLines.slice(0, firstMetaIdx);
       const subQuestionText = subQLines.join('\n').trim();
@@ -1704,7 +1759,8 @@ function parseQuestionBlock(block) {
         correct: subAnswer,
         wrong_answer: subWrongAnswer,
         error_reason: subErrorReason,
-        tags: subTags
+        tags: subTags,
+        chapter: subChapter
       });
     }
     
@@ -3011,6 +3067,39 @@ function setupEventDelegation() {
         return;
       }
     }
+
+    // --- Exam Week Mode Event Delegation ---
+
+    // Exam option selection (choice questions) - uses data-exam-option-q, not data-action
+    const examOptBtn = e.target.closest('[data-exam-option-q]');
+    if (examOptBtn) {
+      const qId = examOptBtn.dataset.examOptionQ;
+      _examAnswers[qId] = examOptBtn.dataset.examOption;
+      // Local UI update
+      examOptBtn.closest('.option-list').querySelectorAll('.option-item').forEach(item => {
+        if (item.dataset.examOptionQ === qId) {
+          item.classList.toggle('selected', item.dataset.examOption === examOptBtn.dataset.examOption);
+        }
+      });
+      // Update answered count
+      const countEl = document.querySelector('.exam-top-right span');
+      if (countEl) {
+        const session = _examSession;
+        if (session) {
+          const total = (session.questions || []).length;
+          const answered = Object.keys(_examAnswers).length;
+          countEl.textContent = `${answered}/${total}`;
+        }
+      }
+      return;
+    }
+
+    // Variant question type toggle (show/hide options section) - uses id, not data-action
+    const variantTypeSelect = e.target.closest('#variant-question-type');
+    if (variantTypeSelect) {
+      const optsSection = document.getElementById('variant-options-section');
+      if (optsSection) optsSection.style.display = variantTypeSelect.value === 'choice' ? 'block' : 'none';
+    }
   });
 
   // Fill-in input changes (delegated input event)
@@ -3026,6 +3115,18 @@ function setupEventDelegation() {
           const val = fillInput.value;
           preview.innerHTML = val ? (renderSubSup(val) || '<span style="color:#bbb">答案预览</span>') : '<span style="color:#bbb">答案预览</span>';
         }
+      }
+    }
+
+    // Exam fill-in input changes
+    const examFillInput = e.target.closest('[data-exam-fill-q]');
+    if (examFillInput) {
+      _examAnswers[examFillInput.dataset.examFillQ] = examFillInput.value;
+      // Update preview
+      const preview = examFillInput.parentElement.querySelector('[data-exam-fill-preview]');
+      if (preview) {
+        const val = examFillInput.value;
+        preview.innerHTML = val ? (renderSubSup(val) || '<span style="color:#bbb">答案预览</span>') : '<span style="color:#bbb">答案预览</span>';
       }
     }
   });
@@ -3522,6 +3623,64 @@ async function handleAction(action, dataset) {
     case 'fav-batch-move-folders': showFavFolderMoveModal(); break;
     case 'fav-back': navigate('favorites'); break;
     case 'fav-edit-folder': handleFavEditFolder(parseInt(dataset.folderId)); break;
+
+    // --- Exam Week Mode Actions ---
+    case 'nav-exam': navigate('exam'); break;
+    case 'exam-generate': handleExamGenerate(dataset); break;
+    case 'exam-start': navigate('exam-taking'); loadExamForTaking(parseInt(dataset.id)); break;
+    case 'exam-submit': handleExamSubmit(parseInt(dataset.id)); break;
+    case 'exam-review': navigate('exam-review'); loadExamReview(parseInt(dataset.id)); break;
+    case 'exam-history': navigate('exam-history'); loadExamHistory(); break;
+    case 'exam-dashboard': navigate('exam-dashboard'); loadExamDashboard(); break;
+    case 'exam-print': handleExamPrint(parseInt(dataset.id)); break;
+    case 'exam-pause': handleExamPause(parseInt(dataset.id)); break;
+    case 'add-variant': handleAddVariant(parseInt(dataset.mistakeId)); break;
+    case 'save-variant': handleSaveVariant(parseInt(dataset.mistakeId)); break;
+    case 'nav-back-exam': navigate('exam'); break;
+
+    // Exam UI interactions (handled via handleAction since they use data-action)
+    case 'exam-select-mode':
+      _examMode = dataset.mode;
+      if (_examMode === 'custom' && _examSubjectId) { loadExamChapters(_examSubjectId); }
+      else if (_examMode !== 'custom') { const s = document.getElementById('exam-chapter-section'); if (s) s.style.display = 'none'; }
+      document.querySelectorAll('.exam-mode-card').forEach(c => c.classList.toggle('active', c.dataset.mode === _examMode));
+      break;
+    case 'exam-select-intensity':
+      _examIntensity = dataset.intensity;
+      document.querySelectorAll('.exam-intensity-btn').forEach(b => b.classList.toggle('active', b.dataset.intensity === _examIntensity));
+      break;
+    case 'exam-select-subject':
+      _examSubjectId = parseInt(dataset.id);
+      document.querySelectorAll('.exam-subject-item').forEach(item => {
+        const isActive = parseInt(item.dataset.id) === _examSubjectId;
+        item.classList.toggle('active', isActive);
+        item.style.background = isActive ? 'var(--accent-light)' : 'var(--bg-card)';
+        item.style.border = isActive ? '1.5px solid var(--accent)' : '1.5px solid transparent';
+        item.style.fontWeight = isActive ? '600' : '400';
+      });
+      _updateExamGenerateBtn();
+      if (_examMode === 'custom') loadExamChapters(_examSubjectId);
+      break;
+    case 'exam-goto-q':
+      _examCurrentQ = parseInt(dataset.qindex);
+      render();
+      break;
+    case 'exam-prev-q':
+      if (_examCurrentQ > 0) { _examCurrentQ--; render(); }
+      break;
+    case 'exam-next-q':
+      if (_examSession && _examCurrentQ < (_examSession.questions || []).length - 1) { _examCurrentQ++; render(); }
+      break;
+    case 'exam-toggle-timer':
+      _examTimerVisible = !_examTimerVisible;
+      { const timerEl = document.querySelector('.exam-timer');
+        if (timerEl) {
+          if (_examTimerVisible) { const m = Math.floor(_examSeconds / 60); const s = _examSeconds % 60; timerEl.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`; timerEl.classList.remove('exam-timer-hidden'); }
+          else { timerEl.textContent = '--:--'; timerEl.classList.add('exam-timer-hidden'); }
+        }
+      }
+      break;
+
     default: break;
   }
 }
@@ -7674,12 +7833,13 @@ D. 15
 标签：质数与合数</pre>
               </div>
               <p><b>自动识别题型：</b>有 ABCD 选项 → 选择题，否则 → 填空题。</p>
-              <p><b>多小题大题：</b>在一道题内用 (a) (b) (c) 或 (1) (2) (3) 标记小题，每个小题单独写答案和错因。</p>
+              <p><b>多小题大题：</b>在一道题内用 (a) (b) (c) 或 (1) (2) (3) 标记小题，每个小题单独写答案和错因。每个小题可单独指定章节。</p>
 <pre>1. 物体从静止开始做匀加速直线运动，加速度为2m/s²，求：
 (a) 3秒后的速度
 答案：6m/s
 我写了：5m/s
 错因：粗心失误
+章节：运动的描述
 (b) 3秒内的位移
 答案：9m
 我写了：9m
@@ -7687,6 +7847,7 @@ D. 15
 答案：5m
 我写了：6m
 错因：概念混淆
+章节：匀变速直线运动
 标签：匀加速直线运动</pre>
               <p><b>答案标记：</b>答案：/ Answer: / 正确答案：均可</p>
               <p><b>错误答案标记：</b>我写了：/ 我的答案：/ 错误答案：/ 我答的：均可</p>
@@ -8215,6 +8376,7 @@ function renderMistakeBatchParsedCards() {
                 ${sq.error_reason_type ? `<div style="font-size:0.82rem;margin-bottom:2px;">${renderErrorReasonTypeBadge(sq.error_reason_type)}</div>` : ''}
                 ${sq.error_reason ? `<div style="font-size:0.82rem;color:var(--text-secondary);">错因补充：${renderSubSup(sq.error_reason)}</div>` : ''}
                 ${sq.tags ? `<div style="font-size:0.82rem;color:var(--text-secondary);">标签：${renderSubSup(sq.tags)}</div>` : ''}
+                ${sq.chapter ? `<div style="font-size:0.82rem;color:#1976d2;">📂 章节：${renderSubSup(sq.chapter)}</div>` : ''}
               </div>
             `).join('')}
           </div>
@@ -8255,6 +8417,10 @@ function renderMistakeBatchParsedCards() {
                 <div class="form-group" style="margin-bottom:0;">
                   <label class="form-label" style="font-size:0.78rem;">标签</label>
                   <input class="form-input" id="mb-sq-tg-${i}-${si}" placeholder="标签" value="${escapeHtml(sq.tags || '')}" oninput="mistakeBatchParsed[${i}].sub_questions[${si}].tags=this.value" style="font-size:0.85rem;" />
+                </div>
+                <div class="form-group" style="margin-bottom:0;">
+                  <label class="form-label" style="font-size:0.78rem;">章节</label>
+                  <input class="form-input" id="mb-sq-ch-${i}-${si}" placeholder="章节（选填）" value="${escapeHtml(sq.chapter || '')}" oninput="mistakeBatchParsed[${i}].sub_questions[${si}].chapter=this.value" style="font-size:0.85rem;" />
                 </div>
               </div>
             `).join('')}
@@ -8855,7 +9021,8 @@ async function handleSubmitBatch() {
           wrong_answer: sq.wrong_answer || '',
           error_reason: sq.error_reason || '',
           error_reason_type: sq.error_reason_type || '',
-          tags: sq.tags || ''
+          tags: sq.tags || '',
+          chapter: sq.chapter || ''
         }))
       });
     }
@@ -9899,6 +10066,819 @@ async function showFavMoveModal() {
 
 
 // --- Init ---
+// ========================================
+// Exam Week Mode
+// ========================================
+
+function renderExam() {
+  const subjects = state.subjects || [];
+  const modeCards = [
+    { id: 'daily', icon: '📋', title: '日常小测', desc: '每日针对性练习' },
+    { id: 'comprehensive', icon: '📝', title: '综合大考', desc: '全真模拟考试' },
+    { id: 'custom', icon: '📂', title: '自定义单元', desc: '选择特定单元练习' },
+  ];
+  const intensityOptions = [
+    { id: 'full', icon: '🔥', label: '完整冲刺', desc: '8-12题' },
+    { id: 'light', icon: '🌱', label: '轻量复习', desc: '3-5题' },
+  ];
+
+  return `
+    <div class="page">
+      <div class="top-bar">
+        <button class="back-btn" data-action="nav-home">←</button>
+        <h1>考试周模式</h1>
+        <div></div>
+      </div>
+
+      <!-- Mode Selection -->
+      <div class="section-header"><span class="section-title">选择模式</span></div>
+      <div class="exam-mode-cards">
+        ${modeCards.map(m => `
+          <div class="exam-mode-card ${_examMode === m.id ? 'active' : ''}" data-action="exam-select-mode" data-mode="${m.id}">
+            <div class="exam-mode-icon">${m.icon}</div>
+            <div class="exam-mode-title">${m.title}</div>
+            <div class="exam-mode-desc">${m.desc}</div>
+          </div>
+        `).join('')}
+      </div>
+
+      <!-- Intensity Toggle -->
+      <div class="section-header" style="margin-top:20px;"><span class="section-title">强度选择</span></div>
+      <div class="exam-intensity-bar">
+        ${intensityOptions.map(o => `
+          <button class="exam-intensity-btn ${_examIntensity === o.id ? 'active' : ''}" data-action="exam-select-intensity" data-intensity="${o.id}">
+            ${o.icon} ${o.label} <span class="exam-intensity-desc">${o.desc}</span>
+          </button>
+        `).join('')}
+      </div>
+
+      <!-- Subject Selection -->
+      <div class="section-header" style="margin-top:20px;"><span class="section-title">选择学科</span></div>
+      <div id="exam-subject-list" class="exam-subject-list">
+        <div class="skeleton" style="height:48px;margin-bottom:8px;"></div>
+        <div class="skeleton" style="height:48px;margin-bottom:8px;"></div>
+      </div>
+
+      <!-- Custom: Chapter Selection -->
+      <div id="exam-chapter-section" style="display:none;margin-top:16px;">
+        <div class="section-header"><span class="section-title">选择单元</span></div>
+        <div id="exam-chapter-list"></div>
+      </div>
+
+      <!-- Generate Button -->
+      <div style="margin-top:24px;">
+        <button class="btn btn-primary btn-block" id="exam-generate-btn" data-action="exam-generate" disabled style="opacity:0.5;">
+          🎯 生成试卷
+        </button>
+      </div>
+
+      <!-- Bottom Links -->
+      <div style="display:flex;gap:12px;margin-top:24px;">
+        <button class="btn btn-secondary btn-sm" data-action="exam-dashboard" style="flex:1;">📊 数据面板</button>
+        <button class="btn btn-secondary btn-sm" data-action="exam-history" style="flex:1;">📜 历史记录</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderExamTaking() {
+  const session = _examSession;
+  if (!session) return renderExam();
+  const questions = session.questions || [];
+  if (questions.length === 0) return renderExam();
+  const q = questions[_examCurrentQ];
+  if (!q) return renderExam();
+
+  const total = questions.length;
+  const answered = Object.keys(_examAnswers).length;
+  const isLast = _examCurrentQ === total - 1;
+  const isFirst = _examCurrentQ === 0;
+
+  // Timer display
+  const mins = Math.floor(_examSeconds / 60);
+  const secs = _examSeconds % 60;
+  const timerDisplay = _examTimerVisible
+    ? `<span class="exam-timer">${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}</span>`
+    : `<span class="exam-timer exam-timer-hidden">--:--</span>`;
+
+  // Question navigation dots
+  const dots = questions.map((qq, i) => {
+    const isAnswered = _examAnswers[qq.id] !== undefined && _examAnswers[qq.id] !== '';
+    let dotClass = 'exam-dot';
+    if (i === _examCurrentQ) dotClass += ' current';
+    else if (isAnswered) dotClass += ' answered';
+    else dotClass += ' unanswered';
+    return `<span class="${dotClass}" data-action="exam-goto-q" data-qindex="${i}"></span>`;
+  }).join('');
+
+  // Question content
+  let questionContent = '';
+  const qType = q.question_type || 'fill';
+
+  if (qType === 'choice') {
+    const options = (typeof q.options === 'string' ? JSON.parse(q.options) : q.options) || [];
+    const letters = options.map((_, i) => String.fromCharCode(65 + i));
+    const currentAnswer = _examAnswers[q.id] || '';
+    questionContent = `
+      <div class="option-list">
+        ${options.map((opt, i) => {
+          const letter = letters[i];
+          const selected = letter === currentAnswer;
+          return `<div class="option-item ${selected ? 'selected' : ''}" data-exam-option-q="${q.id}" data-exam-option="${letter}">
+            <span class="option-letter">${letter}</span>
+            <span>${renderSubSup(opt)}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    `;
+  } else if (q.sub_questions && q.sub_questions.length > 0) {
+    // Big question with sub-questions
+    questionContent = q.sub_questions.map((sq, si) => {
+      const subKey = `${q.id}_${si}`;
+      const subAns = _examAnswers[subKey] || '';
+      return `
+        <div class="exam-sub-question">
+          <div class="exam-sub-q-label">(${si + 1}) ${renderSubSup(sq.question_text || sq.text || '')}</div>
+          <input class="fill-input sym-target exam-fill-input" data-exam-fill-q="${subKey}" placeholder="作答" value="${escapeHtml(subAns)}" />
+          <div class="edit-preview-box" data-exam-fill-preview="${subKey}">${renderSubSup(subAns) || '<span style="color:#bbb">答案预览</span>'}</div>
+          <div class="symbol-bar-wrap"></div>
+        </div>
+      `;
+    }).join('');
+  } else {
+    // Fill-in question
+    const currentAnswer = _examAnswers[q.id] || '';
+    questionContent = `
+      <input class="fill-input sym-target exam-fill-input" data-exam-fill-q="${q.id}" placeholder="输入答案" value="${escapeHtml(currentAnswer)}" />
+      <div class="edit-preview-box" data-exam-fill-preview="${q.id}">${renderSubSup(currentAnswer) || '<span style="color:#bbb">答案预览</span>'}</div>
+      <div class="symbol-bar-wrap"></div>
+    `;
+  }
+
+  return `
+    <div class="page">
+      <div class="exam-top-bar">
+        <button class="back-btn" data-action="nav-back-exam">←</button>
+        <div class="exam-top-center">
+          ${timerDisplay}
+          <button class="exam-timer-toggle" data-action="exam-toggle-timer">👁</button>
+        </div>
+        <div class="exam-top-right">
+          <span style="font-size:0.85rem;color:var(--text-secondary);">${answered}/${total}</span>
+        </div>
+      </div>
+
+      <!-- Question dots navigation -->
+      <div class="exam-dots-bar">${dots}</div>
+
+      <!-- Question content -->
+      <div class="exam-question-area">
+        <div class="exam-question-header">
+          <span class="exam-q-number">第 ${_examCurrentQ + 1} 题</span>
+          <span class="exam-q-type">${qType === 'choice' ? '选择题' : '填空题'}</span>
+        </div>
+        <div class="exam-question-text">${renderSubSup(q.question_text)}</div>
+        ${questionContent}
+      </div>
+
+      <!-- Bottom navigation -->
+      <div class="exam-bottom-bar">
+        <button class="btn btn-secondary" ${isFirst ? 'disabled style="opacity:0.4;"' : ''} data-action="exam-prev-q">← 上一题</button>
+        ${isLast
+          ? `<button class="btn btn-primary" data-action="exam-submit">提交试卷</button>`
+          : `<button class="btn btn-primary" data-action="exam-next-q">下一题 →</button>`
+        }
+      </div>
+    </div>
+  `;
+}
+
+function renderExamResult() {
+  const result = _examResult;
+  if (!result) return renderExam();
+
+  const pct = result.total ? Math.round(result.score / result.total * 100) : 0;
+  const grade = pct >= 90 ? 'A' : pct >= 80 ? 'B' : pct >= 70 ? 'C' : pct >= 60 ? 'D' : 'F';
+  const gradeColor = pct >= 90 ? '#4caf50' : pct >= 70 ? '#ff9800' : '#f44336';
+  const emoji = pct >= 90 ? '🎉' : pct >= 70 ? '👍' : pct >= 50 ? '💪' : '📚';
+
+  const answers = result.answers || [];
+
+  return `
+    <div class="page">
+      <div class="top-bar">
+        <button class="back-btn" data-action="nav-exam">←</button>
+        <h1>考试结果</h1>
+        <div></div>
+      </div>
+
+      <!-- Score Card -->
+      <div class="card exam-result-card" style="text-align:center;">
+        <div style="font-size:3rem;margin-bottom:8px;">${emoji}</div>
+        <div class="exam-result-pct" style="color:${gradeColor};">${pct}%</div>
+        <div class="exam-result-grade" style="color:${gradeColor};">等级 ${grade}</div>
+        <div class="exam-result-detail">${result.score} / ${result.total} 正确</div>
+      </div>
+
+      <!-- Per-question breakdown -->
+      <div class="section-header" style="margin-top:20px;"><span class="section-title">逐题详情</span></div>
+      ${answers.map((a, i) => {
+        const isCorrect = a.is_correct;
+        // Build options HTML for choice questions
+        let optsHTML = '';
+        if (a.question_type === 'choice' && a.options) {
+          let opts = [];
+          try { opts = typeof a.options === 'string' ? JSON.parse(a.options) : a.options; } catch(e) { opts = []; }
+          optsHTML = '<div class="mistake-options" style="margin-top:6px;font-size:0.82rem;color:var(--text-secondary);line-height:1.6;">' +
+            opts.map((o, j) => {
+              const letter = String.fromCharCode(65 + j);
+              const isC = letter === a.correct_answer;
+              const isW = letter === a.user_answer;
+              const st = isC ? 'font-weight:600;color:#5a9a6a;' : isW ? 'text-decoration:underline;color:var(--danger);' : '';
+              return '<div style="' + st + '"><span style="font-weight:600;margin-right:2px;">' + letter + '.</span> ' + renderSubSup(o) + '</div>';
+            }).join('') + '</div>';
+        }
+        return `
+          <div class="card exam-result-question" style="margin-bottom:10px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+              <span>${isCorrect ? '✅' : '❌'}</span>
+              <span style="font-weight:600;font-size:0.9rem;">第 ${i + 1} 题</span>
+            </div>
+            <div style="font-size:0.9rem;margin-bottom:8px;">${renderSubSup(a.question_text)}</div>
+            ${optsHTML}
+            ${!isCorrect ? `
+              <div class="exam-answer-row">
+                <span class="exam-answer-label" style="color:var(--danger);">你的答案</span>
+                <span style="color:var(--danger);font-weight:500;">${renderSubSup(a.user_answer || '(空)')}</span>
+              </div>
+              <div class="exam-answer-row">
+                <span class="exam-answer-label" style="color:#5a9a6a;">正确答案</span>
+                <span style="color:#5a9a6a;font-weight:500;">${renderSubSup(a.correct_answer)}</span>
+              </div>
+              <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--border);">
+                <div style="font-size:0.82rem;color:var(--text-secondary);margin-bottom:6px;">💡 分析失分原因</div>
+                <textarea class="form-input exam-analysis-input" data-exam-analysis-q="${a.question_id}" placeholder="输入你的失分分析..." rows="2" style="width:100%;resize:vertical;font-size:0.85rem;"></textarea>
+                <button class="btn btn-outline btn-sm" style="margin-top:6px;" data-action="add-variant" data-mistake-id="${a.mistake_id || 0}">➕ 添加变式题</button>
+              </div>
+            ` : ''}
+          </div>
+        `;
+      }).join('')}
+
+      <!-- Bottom Actions -->
+      <div style="display:flex;gap:8px;margin-top:16px;">
+        <button class="btn btn-secondary" data-action="nav-exam" style="flex:1;">返回首页</button>
+        <button class="btn btn-primary" data-action="exam-print" data-id="${result.session_id}" style="flex:1;">🖨️ 打印试卷</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderExamReview() {
+  const q = _examReviewQuestion;
+  if (!q) return renderExam();
+
+  return `
+    <div class="page">
+      <div class="top-bar">
+        <button class="back-btn" data-action="nav-back-exam">←</button>
+        <h1>错题复盘</h1>
+        <div></div>
+      </div>
+
+      <!-- Original question -->
+      <div class="card" style="margin-bottom:16px;">
+        <div style="font-size:0.85rem;color:var(--text-secondary);margin-bottom:8px;">题目原文</div>
+        <div style="font-size:0.95rem;line-height:1.6;">${renderSubSup(q.question_text)}</div>
+        <div style="margin-top:8px;">
+          <span style="font-size:0.85rem;color:#5a9a6a;font-weight:500;">正确答案：${renderSubSup(q.correct_answer)}</span>
+        </div>
+      </div>
+
+      <!-- Error Analysis -->
+      <div class="card" style="margin-bottom:16px;">
+        <div style="font-size:0.9rem;font-weight:600;margin-bottom:10px;">🎯 失分点分析</div>
+        <textarea id="exam-review-analysis" class="form-input" placeholder="输入或粘贴 AI 分析 / 自己总结的失分点..." rows="4" style="width:100%;resize:vertical;font-size:0.9rem;">${escapeHtml(q.error_analysis || '')}</textarea>
+      </div>
+
+      <!-- Bound knowledge points (tags) -->
+      <div class="card" style="margin-bottom:16px;">
+        <div style="font-size:0.9rem;font-weight:600;margin-bottom:10px;">🏷️ 绑定考点</div>
+        <div id="exam-review-tags" style="display:flex;flex-wrap:wrap;gap:6px;">
+          ${(q.tags || []).map(t => `<span class="tag-ref-chip" style="padding:4px 10px;background:var(--accent-light);color:var(--accent);border-radius:12px;font-size:0.8rem;font-weight:500;">${escapeHtml(t)}</span>`).join('')}
+          ${(q.tags || []).length === 0 ? '<span style="color:var(--text-tertiary);font-size:0.85rem;">暂无标签</span>' : ''}
+        </div>
+      </div>
+
+      <!-- Variant question input -->
+      <div class="card" style="margin-bottom:16px;">
+        <div style="font-size:0.9rem;font-weight:600;margin-bottom:10px;">📝 录入变式题</div>
+        <div class="form-group">
+          <label class="form-label">题目文本</label>
+          <textarea id="variant-question-text" class="form-input sym-target" placeholder="输入变式题题目..." rows="3" style="width:100%;resize:vertical;font-size:0.9rem;"></textarea>
+          <div class="symbol-bar-wrap"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">题型</label>
+          <select id="variant-question-type" class="form-input" style="width:100%;">
+            <option value="fill">填空题</option>
+            <option value="choice">选择题</option>
+          </select>
+        </div>
+        <div id="variant-options-section" style="display:none;">
+          <div class="form-group">
+            <label class="form-label">选项（每行一个）</label>
+            <textarea id="variant-options" class="form-input" placeholder="A. 选项1&#10;B. 选项2&#10;C. 选项3&#10;D. 选项4" rows="4" style="width:100%;resize:vertical;font-size:0.9rem;"></textarea>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">标准答案</label>
+          <input id="variant-correct-answer" class="form-input sym-target" placeholder="输入标准答案" style="width:100%;" />
+          <div class="symbol-bar-wrap"></div>
+        </div>
+        <button class="btn btn-primary btn-block" data-action="save-variant" data-mistake-id="${q.mistake_id || 0}">💾 保存变式题</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderExamHistory() {
+  const sessions = _examHistory || [];
+  const modeLabels = { daily: '日常小测', comprehensive: '综合大考', custom: '自定义单元' };
+
+  return `
+    <div class="page">
+      <div class="top-bar">
+        <button class="back-btn" data-action="nav-back-exam">←</button>
+        <h1>考试历史</h1>
+        <div></div>
+      </div>
+
+      ${sessions.length === 0 ? `
+        <div class="card" style="text-align:center;padding:40px;color:var(--text-tertiary);">
+          <div style="font-size:2rem;margin-bottom:12px;">📭</div>
+          还没有考试记录<br>
+          <span style="font-size:0.85rem;">去生成一份试卷开始吧</span>
+        </div>
+      ` : sessions.map(s => {
+        const pct = s.total ? Math.round((s.score || 0) / s.total * 100) : 0;
+        const pctColor = pct >= 70 ? '#5a9a6a' : pct >= 50 ? '#e8a87c' : '#e07a6f';
+        const statusLabel = s.status === 'completed' ? '✅ 已完成' : s.status === 'paused' ? '⏸ 已暂停' : '📝 进行中';
+        return `
+          <div class="card exam-history-card" style="margin-bottom:10px;cursor:pointer;" data-action="exam-review" data-id="${s.id}">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <div>
+                <div style="font-size:0.9rem;font-weight:600;">${modeLabels[s.mode] || s.mode}</div>
+                <div style="font-size:0.8rem;color:var(--text-tertiary);">${s.subject_name || '—'} · ${s.question_count || 0}题 · ${formatDate(s.submitted_at || s.started_at)}</div>
+              </div>
+              <div style="text-align:right;">
+                <div style="font-size:1.2rem;font-weight:700;color:${pctColor};">${s.status === 'completed' ? pct + '%' : '—'}</div>
+                <div style="font-size:0.75rem;color:var(--text-tertiary);">${statusLabel}</div>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('')}
+
+      <div style="margin-top:16px;">
+        <button class="btn btn-secondary btn-block" data-action="nav-back-exam">返回考试周</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderExamDashboard() {
+  const stats = _examStats;
+  if (!stats) {
+    return `
+      <div class="page">
+        <div class="top-bar">
+          <button class="back-btn" data-action="nav-back-exam">←</button>
+          <h1>数据面板</h1>
+          <div></div>
+        </div>
+        <div style="text-align:center;padding:40px;color:var(--text-tertiary);">
+          <div class="skeleton" style="height:80px;margin-bottom:12px;"></div>
+          <div class="skeleton" style="height:80px;"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  const masteredRate = stats.total_mistakes ? Math.round(stats.mastered_count / stats.total_mistakes * 100) : 0;
+  const estimatedScore = stats.estimated_score || 0;
+  const subjectStats = stats.subject_stats || [];
+  const recentExams = stats.recent_exams || [];
+
+  // Simple CSS trend line for recent exams
+  const trendMax = recentExams.length > 0 ? Math.max(...recentExams.map(e => e.percentage || 0), 100) : 100;
+  const trendPoints = recentExams.slice(-8).map((e, i) => {
+    const x = recentExams.length <= 1 ? 50 : (i / (recentExams.length - 1)) * 100;
+    const y = 100 - ((e.percentage || 0) / trendMax * 80);
+    return `${x},${y}`;
+  }).join(' ');
+
+  return `
+    <div class="page">
+      <div class="top-bar">
+        <button class="back-btn" data-action="nav-back-exam">←</button>
+        <h1>数据面板</h1>
+        <div></div>
+      </div>
+
+      <!-- Top Stats -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-value" style="color:#5a9a6a;">${stats.mastered_count || 0}</div>
+          <div class="stat-label">已掌握</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" style="color:var(--accent);">${Math.round(estimatedScore)}</div>
+          <div class="stat-label">保底预估分</div>
+        </div>
+      </div>
+
+      <!-- Mastery Progress -->
+      <div class="card" style="margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-size:0.9rem;font-weight:600;">总体掌握率</span>
+          <span style="font-size:0.9rem;font-weight:700;color:var(--accent);">${masteredRate}%</span>
+        </div>
+        <div class="exam-progress-bar">
+          <div class="exam-progress-fill" style="width:${masteredRate}%;"></div>
+        </div>
+        <div style="font-size:0.8rem;color:var(--text-tertiary);margin-top:4px;">${stats.mastered_count || 0} / ${stats.total_mistakes || 0} 题</div>
+      </div>
+
+      <!-- Per-Subject Progress -->
+      ${subjectStats.length > 0 ? `
+        <div class="section-header"><span class="section-title">各学科进度</span></div>
+        ${subjectStats.map(s => {
+          const meta = SUBJECT_META[s.subject_id] || { icon: '📚', bg: '#f5f5f5' };
+          const rate = s.rate || 0;
+          return `
+            <div class="card" style="margin-bottom:8px;padding:14px;">
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                <span style="width:28px;height:28px;border-radius:8px;background:${meta.bg};display:flex;align-items:center;justify-content:center;font-size:0.85rem;">${meta.icon}</span>
+                <span style="flex:1;font-size:0.9rem;font-weight:500;">${escapeHtml(s.subject_name)}</span>
+                <span style="font-size:0.85rem;font-weight:600;color:var(--accent);">${Math.round(rate * 100)}%</span>
+              </div>
+              <div class="exam-progress-bar">
+                <div class="exam-progress-fill" style="width:${Math.round(rate * 100)}%;"></div>
+              </div>
+              <div style="font-size:0.75rem;color:var(--text-tertiary);margin-top:3px;">${s.mastered || 0} / ${s.total || 0} 题</div>
+            </div>
+          `;
+        }).join('')}
+      ` : ''}
+
+      <!-- Recent Exam Trend -->
+      ${recentExams.length > 1 ? `
+        <div class="section-header" style="margin-top:16px;"><span class="section-title">近期考试趋势</span></div>
+        <div class="card" style="padding:16px;">
+          <svg viewBox="0 0 100 100" style="width:100%;height:120px;overflow:visible;" preserveAspectRatio="none">
+            <polyline points="${trendPoints}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            ${recentExams.slice(-8).map((e, i) => {
+              const x = recentExams.length <= 1 ? 50 : (i / (recentExams.length - 1)) * 100;
+              const y = 100 - ((e.percentage || 0) / trendMax * 80);
+              return `<circle cx="${x}" cy="${y}" r="2.5" fill="var(--accent)"/>`;
+            }).join('')}
+          </svg>
+          <div style="display:flex;justify-content:space-between;margin-top:6px;">
+            <span style="font-size:0.7rem;color:var(--text-tertiary);">${formatDate(recentExams[0]?.submitted_at || recentExams[0]?.started_at)}</span>
+            <span style="font-size:0.7rem;color:var(--text-tertiary);">${formatDate(recentExams[recentExams.length - 1]?.submitted_at || recentExams[recentExams.length - 1]?.started_at)}</span>
+          </div>
+        </div>
+      ` : ''}
+
+      <div style="margin-top:16px;">
+        <button class="btn btn-secondary btn-block" data-action="nav-back-exam">返回考试周</button>
+      </div>
+    </div>
+  `;
+}
+
+// --- Exam Data Loading & Handlers ---
+
+async function loadExamSubjects() {
+  const container = document.getElementById('exam-subject-list');
+  if (!container) return;
+  try {
+    let subjects;
+    if (_homeDataCache && _homeDataCache.user_subjects) {
+      subjects = _homeDataCache.user_subjects.all_subjects;
+      const selectedIds = _homeDataCache.user_subjects.selected_subjects;
+      if (selectedIds && selectedIds.length > 0) {
+        subjects = subjects.filter(s => selectedIds.includes(s.id));
+      }
+    } else {
+      const data = await API.get('/api/subjects');
+      subjects = data.subjects || [];
+    }
+    state.subjects = subjects;
+    container.innerHTML = subjects.map(s => {
+      const meta = SUBJECT_META[s.id] || { icon: '📖', bg: '#F0F0F0' };
+      const isActive = _examSubjectId === s.id;
+      return `
+        <div class="exam-subject-item ${isActive ? 'active' : ''}" data-action="exam-select-subject" data-id="${s.id}" style="display:flex;align-items:center;gap:12px;padding:12px 16px;background:${isActive ? 'var(--accent-light)' : 'var(--bg-card)'};border-radius:var(--radius-sm);margin-bottom:8px;box-shadow:var(--shadow);cursor:pointer;transition:var(--transition);border:1.5px solid ${isActive ? 'var(--accent)' : 'transparent'};">
+          <span style="width:32px;height:32px;border-radius:8px;background:${meta.bg};display:flex;align-items:center;justify-content:center;font-size:1rem;">${meta.icon}</span>
+          <span style="font-size:0.9rem;font-weight:${isActive ? '600' : '400'};">${escapeHtml(s.name)}</span>
+        </div>
+      `;
+    }).join('');
+    _updateExamGenerateBtn();
+  } catch (err) {
+    container.innerHTML = '<div style="padding:16px;text-align:center;color:var(--text-tertiary);">加载学科失败</div>';
+  }
+}
+
+async function loadExamChapters(subjectId) {
+  const container = document.getElementById('exam-chapter-list');
+  const section = document.getElementById('exam-chapter-section');
+  if (!container || !section) return;
+  if (!subjectId) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  container.innerHTML = '<div class="skeleton" style="height:48px;"></div>';
+  try {
+    const data = await API.get(`/api/subjects/${subjectId}`);
+    const chapters = data.chapters || [];
+    container.innerHTML = chapters.map(ch => {
+      const isChecked = _examChapterIds.includes(ch.id);
+      return `
+        <label style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg-card);border-radius:var(--radius-xs);margin-bottom:6px;box-shadow:var(--shadow);cursor:pointer;font-size:0.9rem;">
+          <input type="checkbox" class="exam-chapter-cb" data-chapter-id="${ch.id}" ${isChecked ? 'checked' : ''} style="width:18px;height:18px;accent-color:var(--accent);" />
+          <span>U${ch.unit_number} ${escapeHtml(ch.title)}</span>
+        </label>
+      `;
+    }).join('');
+    // Bind checkbox changes
+    container.querySelectorAll('.exam-chapter-cb').forEach(cb => {
+      cb.onchange = () => {
+        const cid = parseInt(cb.dataset.chapterId);
+        if (cb.checked) { if (!_examChapterIds.includes(cid)) _examChapterIds.push(cid); }
+        else { _examChapterIds = _examChapterIds.filter(id => id !== cid); }
+        _updateExamGenerateBtn();
+      };
+    });
+  } catch (err) {
+    container.innerHTML = '<div style="padding:16px;text-align:center;color:var(--text-tertiary);">加载章节失败</div>';
+  }
+}
+
+function _updateExamGenerateBtn() {
+  const btn = document.getElementById('exam-generate-btn');
+  if (!btn) return;
+  const canGenerate = _examSubjectId !== null;
+  btn.disabled = !canGenerate;
+  btn.style.opacity = canGenerate ? '1' : '0.5';
+}
+
+async function handleExamGenerate(dataset) {
+  if (!_examSubjectId) { showToast('请先选择学科'); return; }
+  const btn = document.getElementById('exam-generate-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '生成中...'; }
+  try {
+    const body = {
+      mode: _examMode,
+      intensity: _examIntensity,
+      subject_id: _examSubjectId,
+      chapter_ids: _examMode === 'custom' ? _examChapterIds : [],
+    };
+    const data = await API.post('/api/exam/generate', body);
+    _examSession = data.session;
+    _examAnswers = {};
+    _examCurrentQ = 0;
+    _examSeconds = 0;
+    _examTimerVisible = true;
+    navigate('exam-taking');
+    _startExamTimer();
+  } catch (err) {
+    showToast('生成试卷失败: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🎯 生成试卷'; _updateExamGenerateBtn(); }
+  }
+}
+
+function _startExamTimer() {
+  if (_examTimer) clearInterval(_examTimer);
+  _examTimer = setInterval(() => {
+    _examSeconds++;
+    const timerEl = document.querySelector('.exam-timer');
+    if (timerEl && _examTimerVisible) {
+      const m = Math.floor(_examSeconds / 60);
+      const s = _examSeconds % 60;
+      timerEl.textContent = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    }
+  }, 1000);
+}
+
+async function loadExamForTaking(sessionId) {
+  try {
+    const data = await API.get(`/api/exam/${sessionId}`);
+    _examSession = data.session;
+    _examAnswers = {};
+    _examCurrentQ = 0;
+    _examSeconds = 0;
+    _startExamTimer();
+  } catch (err) {
+    showToast('加载考试失败: ' + err.message);
+    navigate('exam');
+  }
+}
+
+async function handleExamSubmit(sessionId) {
+  const session = _examSession;
+  if (!session) return;
+  const questions = session.questions || [];
+
+  // Build answers array (including sub-question answers)
+  const answers = [];
+  for (const q of questions) {
+    if (q.sub_questions && q.sub_questions.length > 0) {
+      for (let si = 0; si < q.sub_questions.length; si++) {
+        const subKey = `${q.id}_${si}`;
+        answers.push({ question_id: q.id, user_answer: _examAnswers[subKey] || '' });
+      }
+    } else {
+      answers.push({ question_id: q.id, user_answer: _examAnswers[q.id] || '' });
+    }
+  }
+
+  const unanswered = answers.filter(a => !a.user_answer.trim()).length;
+  if (unanswered > 0) {
+    showConfirmModal('提交确认', `还有 ${unanswered} 题未作答，确定提交吗？`, () => _doExamSubmit(sessionId, answers));
+  } else {
+    showConfirmModal('提交确认', '确定要提交试卷吗？提交后不可修改。', () => _doExamSubmit(sessionId, answers));
+  }
+}
+
+async function _doExamSubmit(sessionId, answers) {
+  try {
+    if (_examTimer) { clearInterval(_examTimer); _examTimer = null; }
+    const result = await API.post(`/api/exam/${sessionId}/submit`, { answers });
+    _examResult = result.result;
+    navigate('exam-result');
+  } catch (err) {
+    showToast('提交失败: ' + err.message);
+  }
+}
+
+async function loadExamReview(questionId) {
+  // Find the question from exam result
+  const result = _examResult;
+  if (!result || !result.answers) return;
+  const answer = result.answers.find(a => a.question_id === questionId);
+  if (!answer) return;
+
+  _examReviewQuestion = {
+    question_id: answer.question_id,
+    question_text: answer.question_text,
+    correct_answer: answer.correct_answer,
+    user_answer: answer.user_answer,
+    mistake_id: answer.mistake_id,
+    error_analysis: '',
+    tags: answer.tags || [],
+  };
+
+  // If mistake_id, try to load tags from mistake
+  if (answer.mistake_id) {
+    try {
+      const mistakeData = await API.get(`/api/mistakes/${answer.mistake_id}`);
+      if (mistakeData && mistakeData.tags) {
+        _examReviewQuestion.tags = mistakeData.tags;
+      }
+      if (mistakeData && mistakeData.error_analysis) {
+        _examReviewQuestion.error_analysis = mistakeData.error_analysis;
+      }
+    } catch(e) { /* degrade gracefully */ }
+  }
+  render();
+}
+
+async function loadExamHistory() {
+  try {
+    const data = await API.get('/api/exam/sessions');
+    _examHistory = data.sessions || [];
+    render();
+  } catch (err) {
+    showToast('加载历史失败: ' + err.message);
+  }
+}
+
+async function loadExamDashboard() {
+  try {
+    const data = await API.get('/api/exam/stats');
+    _examStats = data;
+    render();
+  } catch (err) {
+    showToast('加载数据面板失败: ' + err.message);
+  }
+}
+
+function handleExamPause(sessionId) {
+  if (_examTimer) { clearInterval(_examTimer); _examTimer = null; }
+  showToast('考试已暂停');
+  navigate('exam');
+}
+
+function handleExamPrint(sessionId) {
+  const result = _examResult;
+  if (!result) { showToast('无可打印内容'); return; }
+
+  const answers = result.answers || [];
+  let printHTML = `
+    <html><head><meta charset="utf-8"><title>考试试卷</title>
+    <style>
+      body { font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif; padding: 40px; line-height: 1.8; }
+      h1 { text-align: center; margin-bottom: 20px; }
+      .q { margin-bottom: 20px; page-break-inside: avoid; }
+      .q-num { font-weight: 700; }
+      .q-text { margin: 6px 0; }
+      .answer-area { border: 1px dashed #ccc; min-height: 60px; padding: 8px; margin-top: 6px; }
+      .correct { color: green; font-weight: 500; }
+      .wrong { color: red; text-decoration: line-through; }
+      @media print { body { padding: 20px; } }
+    </style></head><body>
+    <h1>考试试卷 · 得分 ${result.score}/${result.total}</h1>
+  `;
+  answers.forEach((a, i) => {
+    const isCorrect = a.is_correct;
+    printHTML += `<div class="q">
+      <div class="q-num">${i + 1}. (${a.question_type === 'choice' ? '选择题' : '填空题'})</div>
+      <div class="q-text">${a.question_text || ''}</div>`;
+    if (a.options) {
+      let opts = [];
+      try { opts = typeof a.options === 'string' ? JSON.parse(a.options) : a.options; } catch(e) {}
+      opts.forEach((o, j) => {
+        const letter = String.fromCharCode(65 + j);
+        printHTML += `<div>${letter}. ${o}</div>`;
+      });
+    }
+    if (!isCorrect) {
+      printHTML += `<div><span class="wrong">你的答案: ${a.user_answer || '(空)'}</span></div>`;
+      printHTML += `<div class="correct">正确答案: ${a.correct_answer}</div>`;
+    } else {
+      printHTML += `<div class="correct">✅ ${a.correct_answer}</div>`;
+    }
+    printHTML += `<div class="answer-area"></div></div>`;
+  });
+  printHTML += `</body></html>`;
+
+  const iframe = document.createElement('iframe');
+  iframe.style.cssText = 'position:fixed;left:-9999px;width:0;height:0;';
+  document.body.appendChild(iframe);
+  const doc = iframe.contentDocument || iframe.contentWindow.document;
+  doc.open(); doc.write(printHTML); doc.close();
+  iframe.contentWindow.focus();
+  iframe.contentWindow.print();
+  setTimeout(() => iframe.remove(), 1000);
+}
+
+async function handleAddVariant(mistakeId) {
+  // Show variant input section if hidden, or scroll to it
+  const section = document.querySelector('[data-action="save-variant"]');
+  if (section) {
+    section.scrollIntoView({ behavior: 'smooth' });
+  }
+  showToast('请在下方输入变式题内容');
+}
+
+async function handleSaveVariant(mistakeId) {
+  const textEl = document.getElementById('variant-question-text');
+  const typeEl = document.getElementById('variant-question-type');
+  const optsEl = document.getElementById('variant-options');
+  const ansEl = document.getElementById('variant-correct-answer');
+
+  if (!textEl || !ansEl) { showToast('找不到输入框'); return; }
+  const questionText = textEl.value.trim();
+  const correctAnswer = ansEl.value.trim();
+  if (!questionText) { showToast('请输入题目文本'); return; }
+  if (!correctAnswer) { showToast('请输入标准答案'); return; }
+
+  const questionType = typeEl ? typeEl.value : 'fill';
+  let options = [];
+  if (questionType === 'choice' && optsEl) {
+    options = optsEl.value.trim().split('\n').filter(l => l.trim()).map(l => l.replace(/^[A-D]\.\s*/, '').trim());
+  }
+
+  try {
+    await API.post('/api/variants', {
+      source_mistake_id: mistakeId,
+      question_text: questionText,
+      question_type: questionType,
+      options: options,
+      correct_answer: correctAnswer,
+      sub_questions: [],
+    });
+    showToast('变式题已保存 ✅');
+    textEl.value = '';
+    if (optsEl) optsEl.value = '';
+    ansEl.value = '';
+  } catch (err) {
+    showToast('保存失败: ' + err.message);
+  }
+}
+
 function init() {
   setupEventDelegation();
   if (state.token && state.user) {
