@@ -31,7 +31,7 @@ function renderErrorReasonTypeBadge(type) {
 // --- State ---
 const state = {
   token: localStorage.getItem('ata_token') || '',
-  user: JSON.parse(localStorage.getItem('ata_user') || 'null'),
+  user: (function(){ try { return JSON.parse(localStorage.getItem('ata_user') || 'null'); } catch(e) { return null; } })(),
   currentPage: 'home',
   subjects: [],
   currentSubject: null,
