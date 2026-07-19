@@ -8376,7 +8376,7 @@ function renderMistakeBatchParsedCards() {
                 ${sq.error_reason_type ? `<div style="font-size:0.82rem;margin-bottom:2px;">${renderErrorReasonTypeBadge(sq.error_reason_type)}</div>` : ''}
                 ${sq.error_reason ? `<div style="font-size:0.82rem;color:var(--text-secondary);">错因补充：${renderSubSup(sq.error_reason)}</div>` : ''}
                 ${sq.tags ? `<div style="font-size:0.82rem;color:var(--text-secondary);">标签：${renderSubSup(sq.tags)}</div>` : ''}
-                ${sq.chapter ? `<div style="font-size:0.82rem;color:#1976d2;">📂 章节：${renderSubSup(sq.chapter)}</div>` : ''}
+                ${sq.chapter ? `<div style="font-size:0.82rem;color:#1976d2;">📂 章节：${renderSubSup(sq.chapter_display || sq.chapter)}</div>` : ''}
               </div>
             `).join('')}
           </div>
@@ -8796,6 +8796,33 @@ function resolveParsedChapterTitles() {
       }
     }
   });
+  
+  // Also resolve sub-question chapters
+  mistakeBatchParsed.forEach(card => {
+    if (!card.sub_questions) return;
+    card.sub_questions.forEach(sq => {
+      if (!sq.chapter) return;
+      const raw = sq.chapter.trim();
+      let unitNum = null;
+      const numMatch = raw.match(/(\d{1,2})/);
+      if (numMatch) {
+        unitNum = parseInt(numMatch[1]);
+      } else {
+        for (const [num, cn] of Object.entries(cnMap)) {
+          if (raw.includes(cn) || raw.includes(`章节${cn}`)) {
+            unitNum = parseInt(num);
+            break;
+          }
+        }
+      }
+      if (unitNum !== null) {
+        const matched = _batchChaptersCache.find(c => c.unit_number === unitNum);
+        if (matched) {
+          sq.chapter_display = `章节${cnMap[unitNum] || unitNum}：${matched.title}`;
+        }
+      }
+    });
+  });
 }
 
 async function loadBatchMistakesInit() {
@@ -9162,8 +9189,8 @@ async function handleSubmitBatch() {
               key_insight: '',
               question_type: c.type || 'fill',
               options: [],
-              // For mixed mode, include chapter_title for backend to resolve
-              chapter_title: isMixedMode ? c.chapter_title : null
+              // Use sub-question's own chapter if available, otherwise parent's chapter
+              chapter_title: sq.chapter || (isMixedMode ? c.chapter_title : null)
             };
           });
         }
