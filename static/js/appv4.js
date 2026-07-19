@@ -1531,6 +1531,8 @@ function parseBatchText(text) {
     // Lines before first question number are ignored
   }
   if (currentBlock) blocks.push(currentBlock);
+  // If no numbered starters found, treat entire text as one block
+  if (blocks.length === 0 && text.trim()) blocks.push(text.trim());
   
   // Parse each block into a question
   const questions = [];
@@ -1558,7 +1560,7 @@ function parseQuestionBlock(block) {
   // --- Inline sub-question detection: (a) (b) within a single line or mid-line ---
   // If no line-start sub-questions found, check for inline markers like "...(a) xxx (b) yyy"
   if (subQStartIndices.length < 2) {
-    const inlineSubQPattern = /\(([a-z]{1,2}|\d{1,2})\)\s*/g;
+    const inlineSubQPattern = /(?<=[\s（])\(([a-z]{1,2}|\d{1,2})\)\s*/g;
     // Check if any line contains 2+ inline sub-question markers
     for (let i = 0; i < lines.length; i++) {
       const matches = [];
@@ -1577,19 +1579,54 @@ function parseQuestionBlock(block) {
           const end = mi + 1 < matches.length ? matches[mi + 1].index : lines[i].length;
           const subText = lines[i].substring(start, end).trim();
           
-          // Look for answer within sub-text (答案：xxx pattern)
+          // Extract answer (答案：xxx)
           let subAnswer = '';
+          let subWrongAnswer = '';
+          let subErrorReason = '';
+          let subTags = '';
           let subQuestionText = subText;
-          const ansMatch = subText.match(/(?:答案\s*[：:]|正确[答案]\s*[：:]|Answer\s*[：:])\s*(.+)/i);
+          
+          // Extract 错因
+          const ertMatch = subText.match(/\s*错因\s*[：:]\s*(.+?)(?=\s*(?:标签\s*[：:]|章节\s*[：:]|答案\s*[：:]|我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:])|$)/i);
+          if (ertMatch) {
+            subErrorReason = ertMatch[1].trim();
+            subQuestionText = subQuestionText.replace(ertMatch[0], '').trim();
+          }
+          
+          // Extract 标签
+          const tagMatch = subText.match(/\s*标签\s*[：:]\s*(.+?)(?=\s*(?:错因\s*[：:]|章节\s*[：:]|答案\s*[：:]|我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:])|$)/i);
+          if (tagMatch) {
+            subTags = tagMatch[1].trim();
+            subQuestionText = subQuestionText.replace(tagMatch[0], '').trim();
+          }
+          
+          // Extract 章节
+          const chapMatch = subText.match(/\s*章节[：:]\s*(.+?)(?=\s*(?:错因|标签|答案|我写|我的|错误答案|我答)\s*[：:]|$)/i);
+          if (chapMatch) {
+            subQuestionText = subQuestionText.replace(chapMatch[0], '').trim();
+          }
+          
+          // Extract 我写了 / 我的答案 / 错误答案 / 我答的
+          const wrongAnsMatch = subText.match(/(?:我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:])\s*(.+?)(?=\s*(?:错因|标签|章节|答案)\s*[：:]|$)/i);
+          if (wrongAnsMatch) {
+            subWrongAnswer = wrongAnsMatch[1].trim();
+            subQuestionText = subQuestionText.replace(wrongAnsMatch[0], '').trim();
+          }
+          
+          // Extract 答案
+          const ansMatch = subText.match(/(?:答案\s*[：:]|正确[答案]\s*[：:]|Answer\s*[：:])\s*(.+?)(?=\s*(?:我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:]|错因\s*[：:]|标签\s*[：:]|章节\s*[：:])|$)/i);
           if (ansMatch) {
             subAnswer = ansMatch[1].trim();
-            subQuestionText = subText.substring(0, ansMatch.index).trim();
+            subQuestionText = subQuestionText.replace(ansMatch[0], '').trim();
           }
           
           subQuestions.push({
             label: matches[mi].label,
             question: subQuestionText,
-            correct: subAnswer
+            correct: subAnswer,
+            wrong_answer: subWrongAnswer,
+            error_reason: subErrorReason,
+            tags: subTags
           });
         }
         
@@ -1627,24 +1664,47 @@ function parseQuestionBlock(block) {
       // Parse answer from sub-section
       const subLines = [firstLineWithoutLabel, ...sectionLines.slice(1)];
       let subAnswer = '';
+      let subWrongAnswer = '';
+      let subErrorReason = '';
+      let subTags = '';
       let subAnswerIdx = -1;
+      let subWrongIdx = -1;
+      let subErtIdx = -1;
+      let subTagIdx = -1;
+      
       for (let j = subLines.length - 1; j >= 0; j--) {
-        const ansMatch = subLines[j].match(/^(?:【答案】|答案\s*[：:]|正确[答案]\s*[：:]|Answer\s*[：:])\s*(.+)/i);
-        if (ansMatch) {
-          subAnswer = ansMatch[1].trim();
-          subAnswerIdx = j;
-          break;
+        const line = subLines[j];
+        if (subAnswerIdx < 0) {
+          const ansMatch = line.match(/^(?:【答案】|答案\s*[：:]|正确[答案]\s*[：:]|Answer\s*[：:])\s*(.+)/i);
+          if (ansMatch) { subAnswer = ansMatch[1].trim(); subAnswerIdx = j; continue; }
+        }
+        if (subWrongIdx < 0) {
+          const wMatch = line.match(/^(?:我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:])\s*(.+)/i);
+          if (wMatch) { subWrongAnswer = wMatch[1].trim(); subWrongIdx = j; continue; }
+        }
+        if (subErtIdx < 0) {
+          const eMatch = line.match(/^\s*错因[：:]\s*(.+)/i);
+          if (eMatch) { subErrorReason = eMatch[1].trim(); subErtIdx = j; continue; }
+        }
+        if (subTagIdx < 0) {
+          const tMatch = line.match(/^\s*标签[：:]\s*(.+)/i);
+          if (tMatch) { subTags = tMatch[1].trim(); subTagIdx = j; continue; }
         }
       }
       
-      // Question text = lines before answer
-      const subQLines = subAnswerIdx >= 0 ? subLines.slice(0, subAnswerIdx) : subLines;
+      // Question text = lines before any metadata (answer/wrong/ert/tags)
+      const metaIndices = [subAnswerIdx, subWrongIdx, subErtIdx, subTagIdx].filter(x => x >= 0);
+      const firstMetaIdx = metaIndices.length > 0 ? Math.min(...metaIndices) : subLines.length;
+      const subQLines = subLines.slice(0, firstMetaIdx);
       const subQuestionText = subQLines.join('\n').trim();
       
       subQuestions.push({
         label: label,
         question: subQuestionText,
-        correct: subAnswer
+        correct: subAnswer,
+        wrong_answer: subWrongAnswer,
+        error_reason: subErrorReason,
+        tags: subTags
       });
     }
     
@@ -7786,6 +7846,7 @@ function parseMistakeBatchText(text) {
     }
   }
   if (currentBlock) blocks.push(currentBlock);
+  if (blocks.length === 0 && text.trim()) blocks.push(text.trim());
   
   const mistakes = [];
   for (const block of blocks) {
@@ -7799,6 +7860,121 @@ function parseMistakeBatchText(text) {
 function parseMistakeBlock(block) {
   const lines = block.split('\n').map(l => l.trim()).filter(l => l);
   if (lines.length === 0) return null;
+  
+  // --- Sub-question detection: (a) (b) (c) inline markers ---
+  // First check line-start markers: (a), (1), etc. at start of a line
+  const subQMarkerLineStart = /^\(([a-z]{1,2}|\d{1,2})\)\s*/;
+  const subQStartIndices = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (subQMarkerLineStart.test(lines[i])) {
+      subQStartIndices.push(i);
+    }
+  }
+  
+  // Then check inline markers: ...text (a) ...text (b) ... within lines
+  const inlineSubQPattern = /(?<=[\s（])\(([a-z]{1,2}|\d{1,2})\)\s*/g;
+  let allInlineMatches = [];
+  if (subQStartIndices.length < 2) {
+    for (let li = 0; li < lines.length; li++) {
+      let m;
+      inlineSubQPattern.lastIndex = 0;
+      while ((m = inlineSubQPattern.exec(lines[li])) !== null) {
+        allInlineMatches.push({ lineIdx: li, charIdx: m.index, label: m[0].trim(), marker: m[1] });
+      }
+    }
+  }
+  
+  // Helper: extract metadata from sub-question text
+  const parseSubQFields = (subText) => {
+    let subAnswer = '';
+    let subWrongAnswer = '';
+    let subErrorReason = '';
+    let subErrorReasonType = '';
+    let subTags = '';
+    let subQuestionText = subText;
+    // Extract 答案
+    const ansMatch = subText.match(/(?:答案\s*[：:]|正确答案\s*[：:]|【答案】|Answer\s*[：:])\s*(.+?)(?=\s*(?:我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:]|错因(?:分析)?(?:类型)?\s*[：:]|标签\s*[：:]|章节\s*[：:])|$)/i);
+    if (ansMatch) { subAnswer = ansMatch[1].trim(); subQuestionText = subQuestionText.replace(ansMatch[0], '').trim(); }
+    // Extract 我写了
+    const wrongMatch = subText.match(/(?:我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:])\s*(.+?)(?=\s*(?:错因(?:分析)?(?:类型)?\s*[：:]|标签\s*[：:]|章节\s*[：:]|答案\s*[：:]|正确答案\s*[：:]|【答案】|Answer\s*[：:])|$)/i);
+    if (wrongMatch) { subWrongAnswer = wrongMatch[1].trim(); subQuestionText = subQuestionText.replace(wrongMatch[0], '').trim(); }
+    // Extract 错因
+    const errMatch = subText.match(/(?:错因(?:分析)?(?:类型)?\s*[：:])\s*(.+?)(?=\s*(?:标签\s*[：:]|章节\s*[：:]|答案\s*[：:]|正确答案\s*[：:]|【答案】|我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:]|Answer\s*[：:])|$)/i);
+    if (errMatch) {
+      const raw = errMatch[1].trim();
+      const matchedType = ERROR_REASON_TYPES.find(t => t.value === raw || raw.includes(t.value));
+      if (matchedType) {
+        subErrorReasonType = matchedType.value;
+        const remainder = raw.replace(matchedType.value, '').replace(/[，,、]/, '').trim();
+        if (remainder) subErrorReason = remainder;
+      } else {
+        const fuzzyMap = { '知识':'知识性错误','基础':'知识性错误','不会':'知识性错误','不懂':'知识性错误','零基础':'知识性错误','混淆':'概念混淆','搞混':'概念混淆','记混':'概念混淆','分不清':'概念混淆','方法':'方法错误','用错':'方法错误','选错':'方法错误','套路':'方法错误','粗心':'粗心失误','计算':'粗心失误','看错':'粗心失误','漏写':'粗心失误','审题':'粗心失误','忽略':'粗心失误' };
+        for (const [kw, type] of Object.entries(fuzzyMap)) { if (raw.includes(kw)) { subErrorReasonType = type; break; } }
+        subErrorReason = raw;
+      }
+      subQuestionText = subQuestionText.replace(errMatch[0], '').trim();
+    }
+    // Extract 标签
+    const tagMatch = subText.match(/(?:标签\s*[：:]\s*)(.+?)(?=\s*(?:错因(?:分析)?(?:类型)?\s*[：:]|章节\s*[：:]|答案\s*[：:]|正确答案\s*[：:]|【答案】|我写[了]?\s*[：:]|我的答案\s*[：:]|错误答案\s*[：:]|我答[的]?\s*[：:]|Answer\s*[：:])|$)/i);
+    if (tagMatch) { subTags = tagMatch[1].trim(); subQuestionText = subQuestionText.replace(tagMatch[0], '').trim(); }
+    return { question_text: subQuestionText, correct_answer: subAnswer, wrong_answer: subWrongAnswer, error_reason: subErrorReason, error_reason_type: subErrorReasonType, tags: subTags };
+  };
+  
+  // --- Handle multi-line sub-questions: (a) on its own line ---
+  if (subQStartIndices.length >= 2 || (subQStartIndices.length === 1 && subQStartIndices[0] > 0)) {
+    const parentLines = lines.slice(0, subQStartIndices[0]);
+    const parentText = parentLines.join('\n').trim();
+    if (parentText) {
+      const subQuestions = [];
+      for (let si = 0; si < subQStartIndices.length; si++) {
+        const start = subQStartIndices[si];
+        const end = si + 1 < subQStartIndices.length ? subQStartIndices[si + 1] : lines.length;
+        const labelMatch = lines[start].match(subQMarkerLineStart);
+        const label = labelMatch ? labelMatch[0].trim() : '';
+        const firstLineWithoutLabel = lines[start].replace(subQMarkerLineStart, '').trim();
+        const sectionText = [firstLineWithoutLabel, ...lines.slice(start + 1, end)].join('\n').trim();
+        const fields = parseSubQFields(sectionText);
+        subQuestions.push({ label, ...fields });
+      }
+      if (subQuestions.length > 0) {
+        return { type: 'fill', question: parentText, correct_answer: '', wrong_answer: '', error_reason: '', error_reason_type: '', chapter_title: '', tags: '', sub_questions: subQuestions };
+      }
+    }
+  }
+  
+  // --- Handle inline sub-questions: (a) (b) (c) within same line ---
+  if (allInlineMatches.length >= 2) {
+    const firstMatch = allInlineMatches[0];
+    const parentLine = lines[firstMatch.lineIdx];
+    const parentText = parentLine.substring(0, firstMatch.charIdx).trim();
+    const prefixLines = lines.slice(0, firstMatch.lineIdx).join('\n').trim();
+    const fullParentText = (prefixLines ? prefixLines + '\n' : '') + (parentText || '');
+    
+    if (fullParentText) {
+      const subQuestions = [];
+      for (let si = 0; si < allInlineMatches.length; si++) {
+        const curr = allInlineMatches[si];
+        const next = si + 1 < allInlineMatches.length ? allInlineMatches[si + 1] : null;
+        let subText;
+        if (!next || curr.lineIdx === next.lineIdx) {
+          const start = curr.charIdx + curr.label.length;
+          const end = next ? next.charIdx : lines[curr.lineIdx].length;
+          subText = lines[curr.lineIdx].substring(start, end).trim();
+        } else {
+          const start = curr.charIdx + curr.label.length;
+          const firstPart = lines[curr.lineIdx].substring(start).trim();
+          const lastPart = next ? lines[next.lineIdx].substring(0, next.charIdx).trim() : '';
+          const middleLines = lines.slice(curr.lineIdx + 1, next ? next.lineIdx : lines.length).join('\n').trim();
+          subText = [firstPart, middleLines, lastPart].filter(Boolean).join('\n').trim();
+        }
+        const fields = parseSubQFields(subText);
+        subQuestions.push({ label: curr.label, ...fields });
+      }
+      if (subQuestions.length > 0) {
+        return { type: 'fill', question: fullParentText, correct_answer: '', wrong_answer: '', error_reason: '', error_reason_type: '', chapter_title: '', tags: '', sub_questions: subQuestions };
+      }
+    }
+  }
   
   // Find answer line: 答案：/ Answer: / 正确答案：
   let answer = '';
@@ -7986,6 +8162,22 @@ function toggleMistakeBatchCardEdit(i) {
     if (wa) mistakeBatchParsed[i].wrong_answer = wa.value;
     if (er) mistakeBatchParsed[i].error_reason = er.value;
     if (ert) mistakeBatchParsed[i].error_reason_type = ert.value;
+    // Save sub-question fields from edit mode
+    const subQs = mistakeBatchParsed[i].sub_questions || [];
+    for (let si = 0; si < subQs.length; si++) {
+      const sqQ = document.getElementById(`mb-sq-q-${i}-${si}`);
+      const sqCA = document.getElementById(`mb-sq-ca-${i}-${si}`);
+      const sqWA = document.getElementById(`mb-sq-wa-${i}-${si}`);
+      const sqERT = document.getElementById(`mb-sq-ert-${i}-${si}`);
+      const sqER = document.getElementById(`mb-sq-er-${i}-${si}`);
+      const sqTG = document.getElementById(`mb-sq-tg-${i}-${si}`);
+      if (sqQ) { subQs[si].question_text = sqQ.value; subQs[si].question = sqQ.value; }
+      if (sqCA) subQs[si].correct_answer = sqCA.value;
+      if (sqWA) subQs[si].wrong_answer = sqWA.value;
+      if (sqERT) subQs[si].error_reason_type = sqERT.value;
+      if (sqER) subQs[si].error_reason = sqER.value;
+      if (sqTG) subQs[si].tags = sqTG.value;
+    }
     mistakeBatchParsed[i]._editing = false;
   } else {
     // Render mode → switch to edit
@@ -7997,11 +8189,79 @@ function toggleMistakeBatchCardEdit(i) {
 // Render parsed mistake cards with render/edit dual mode
 function renderMistakeBatchParsedCards() {
   return mistakeBatchParsed.map((card, i) => {
+    const subQs = card.sub_questions || [];
+    const hasSubQs = subQs.length > 0;
     const typeBadge = card.type === 'choice' 
       ? '<span class="batch-q-type-badge" style="background:#e3f2fd;color:#1976d2;">选择题</span>'
-      : '<span class="batch-q-type-badge">填空题</span>';
+      : hasSubQs
+        ? '<span class="batch-q-type-badge" style="background:#f3e5f5;color:#7b1fa2;">多小题大题</span>'
+        : '<span class="batch-q-type-badge">填空题</span>';
     
     const isEditing = card._editing === true;
+
+    // --- Generate sub-questions HTML for RENDER mode ---
+    const renderSubQsHTML = () => {
+      if (!hasSubQs) return '';
+      return `
+        <div class="form-group" style="margin-top:8px;">
+          <label class="form-label" style="font-size:0.85rem;color:var(--text-secondary);">📝 包含 ${subQs.length} 道小题</label>
+          <div style="background:#f8f9fa;border-radius:8px;padding:10px;border:1px solid #e8e8e0;">
+            ${subQs.map((sq, si) => `
+              <div style="margin-bottom:${si < subQs.length - 1 ? '10' : '0'}px;${si < subQs.length - 1 ? 'border-bottom:1px dashed #ddd;padding-bottom:10px;' : ''}">
+                <div style="font-weight:600;color:var(--accent);margin-bottom:4px;font-size:0.9rem;">${sq.label || '小题' + (si+1)}</div>
+                <div style="font-size:0.9rem;margin-bottom:4px;line-height:1.5;">${renderSubSup(sq.question_text || sq.question || '')}</div>
+                <div style="font-size:0.85rem;color:#28a745;margin-bottom:2px;">✓ 答案：${renderSubSup(sq.correct_answer || '') || '<span style="color:var(--text-tertiary);font-style:italic;">未填写</span>'}</div>
+                ${sq.wrong_answer ? `<div style="font-size:0.85rem;color:var(--danger,#E07A6F);margin-bottom:2px;">✗ 我的答案：${renderSubSup(sq.wrong_answer)}</div>` : ''}
+                ${sq.error_reason_type ? `<div style="font-size:0.82rem;margin-bottom:2px;">${renderErrorReasonTypeBadge(sq.error_reason_type)}</div>` : ''}
+                ${sq.error_reason ? `<div style="font-size:0.82rem;color:var(--text-secondary);">错因补充：${renderSubSup(sq.error_reason)}</div>` : ''}
+                ${sq.tags ? `<div style="font-size:0.82rem;color:var(--text-secondary);">标签：${renderSubSup(sq.tags)}</div>` : ''}
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    };
+
+    // --- Generate sub-questions HTML for EDIT mode ---
+    const editSubQsHTML = () => {
+      if (!hasSubQs) return '';
+      return `
+        <div class="form-group" style="margin-top:10px;">
+          <label class="form-label" style="font-size:0.85rem;color:var(--text-secondary);">📝 包含 ${subQs.length} 道小题</label>
+          <div style="background:#f8f9fa;border-radius:8px;padding:10px;border:1px solid #e8e8e0;">
+            ${subQs.map((sq, si) => `
+              <div style="margin-bottom:${si < subQs.length - 1 ? '12' : '0'}px;${si < subQs.length - 1 ? 'border-bottom:1px dashed #ddd;padding-bottom:12px;' : ''}">
+                <div style="font-weight:600;color:var(--accent);margin-bottom:6px;">${sq.label || '小题' + (si+1)}</div>
+                <div class="form-group" style="margin-bottom:6px;">
+                  <label class="form-label" style="font-size:0.78rem;">题目</label>
+                  <input class="form-input" id="mb-sq-q-${i}-${si}" placeholder="子题题目" value="${escapeHtml(sq.question_text || sq.question || '')}" oninput="mistakeBatchParsed[${i}].sub_questions[${si}].question_text=this.value;mistakeBatchParsed[${i}].sub_questions[${si}].question=this.value" style="font-size:0.85rem;" />
+                </div>
+                <div class="form-group" style="margin-bottom:6px;">
+                  <label class="form-label" style="font-size:0.78rem;">正确答案</label>
+                  <input class="form-input" id="mb-sq-ca-${i}-${si}" placeholder="正确答案" value="${escapeHtml(sq.correct_answer || '')}" oninput="mistakeBatchParsed[${i}].sub_questions[${si}].correct_answer=this.value" style="font-size:0.85rem;" />
+                </div>
+                <div class="form-group" style="margin-bottom:6px;">
+                  <label class="form-label" style="font-size:0.78rem;">我的错误答案</label>
+                  <input class="form-input" id="mb-sq-wa-${i}-${si}" placeholder="你写的答案" value="${escapeHtml(sq.wrong_answer || '')}" oninput="mistakeBatchParsed[${i}].sub_questions[${si}].wrong_answer=this.value" style="font-size:0.85rem;" />
+                </div>
+                <div class="form-group" style="margin-bottom:4px;">
+                  <label class="form-label" style="font-size:0.78rem;">错因类型</label>
+                  ${renderErrorReasonTypeSelect(`mb-sq-ert-${i}-${si}`, sq.error_reason_type || '', `mistakeBatchParsed[${i}].sub_questions[${si}].error_reason_type=this.value`)}
+                </div>
+                <div class="form-group" style="margin-bottom:0;">
+                  <label class="form-label" style="font-size:0.78rem;">错因补充</label>
+                  <input class="form-input" id="mb-sq-er-${i}-${si}" placeholder="补充说明" value="${escapeHtml(sq.error_reason || '')}" oninput="mistakeBatchParsed[${i}].sub_questions[${si}].error_reason=this.value" style="font-size:0.85rem;" />
+                </div>
+                <div class="form-group" style="margin-bottom:0;">
+                  <label class="form-label" style="font-size:0.78rem;">标签</label>
+                  <input class="form-input" id="mb-sq-tg-${i}-${si}" placeholder="标签" value="${escapeHtml(sq.tags || '')}" oninput="mistakeBatchParsed[${i}].sub_questions[${si}].tags=this.value" style="font-size:0.85rem;" />
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    };
 
     if (isEditing) {
       // --- EDIT MODE: textarea / input ---
@@ -8012,10 +8272,11 @@ function renderMistakeBatchParsedCards() {
           <div style="margin-bottom:8px;">${typeBadge} <span style="font-size:0.8rem;color:var(--text-tertiary);">第 ${i + 1} 题</span></div>
           <div style="background:#FFF8E1;border:1px solid #FFE082;border-radius:8px;padding:6px 10px;margin-bottom:8px;font-size:0.78rem;color:#856404;">💡 不知道怎么排版？拍照上传题目给豆包，让它帮你整理好格式再粘贴回来就行</div>
           <div class="form-group">
-            <label class="form-label" style="font-size:0.85rem;">题目</label>
+            <label class="form-label" style="font-size:0.85rem;">${hasSubQs ? '大题题目' : '题目'}</label>
             <textarea class="form-input" id="mb-q-${i}" placeholder="题目内容..." rows="8" style="min-height:160px;" oninput="mistakeBatchParsed[${i}].question=this.value;document.getElementById('mb-q-preview-${i}').innerHTML=renderSubSup(this.value)||'<span style=color:#bbb>预览区</span>'" style="font-size:0.9rem;">${escapeHtml(card.question)}</textarea>
             <div id="mb-q-preview-${i}" class="edit-preview-box">${renderSubSup(card.question) || '<span style="color:#bbb">预览区</span>'}</div>
           </div>
+          ${!hasSubQs ? `
           <div class="form-group">
             <label class="form-label" style="font-size:0.85rem;">正确答案</label>
             <input class="form-input" id="mb-ca-${i}" placeholder="正确答案" value="${escapeHtml(card.correct_answer)}" oninput="mistakeBatchParsed[${i}].correct_answer=this.value;document.getElementById('mb-ca-preview-${i}').innerHTML=renderSubSup(this.value)||'<span style=color:#bbb>答案预览</span>'" style="font-size:0.9rem;" />
@@ -8035,6 +8296,8 @@ function renderMistakeBatchParsedCards() {
             <label class="form-label" style="font-size:0.85rem;">错因补充</label>
             <textarea class="form-input" id="mb-er-${i}" placeholder="补充说明(可选)" rows="2" oninput="mistakeBatchParsed[${i}].error_reason=this.value" style="font-size:0.9rem;">${escapeHtml(card.error_reason || '')}</textarea>
           </div>
+          ` : ''}
+          ${editSubQsHTML()}
         </div>
       `;
     }
@@ -8053,9 +8316,10 @@ function renderMistakeBatchParsedCards() {
         <button onclick="toggleMistakeBatchCardEdit(${i})" class="mb-edit-btn" title="编辑">✎ 编辑</button>
         <div style="margin-bottom:8px;">${typeBadge} <span style="font-size:0.8rem;color:var(--text-tertiary);">第 ${i + 1} 题</span></div>
         <div class="form-group">
-          <label class="form-label" style="font-size:0.85rem;">题目</label>
+          <label class="form-label" style="font-size:0.85rem;">${hasSubQs ? '大题题目' : '题目'}</label>
           <div class="mb-render-field mb-render-question">${qHtml}</div>
         </div>
+        ${!hasSubQs ? `
         <div class="form-group">
           <label class="form-label" style="font-size:0.85rem;">正确答案</label>
           <div class="mb-render-field mb-render-answer">${caHtml}</div>
@@ -8072,6 +8336,8 @@ function renderMistakeBatchParsedCards() {
           <label class="form-label" style="font-size:0.85rem;">错因补充</label>
           <div class="mb-render-field mb-render-answer mb-click-edit" data-field="error_reason" data-index="${i}" style="cursor:pointer;min-height:32px;">${erHtml || '<span style="color:var(--text-tertiary);font-style:italic;">点击填写...</span>'}</div>
         </div>
+        ` : ''}
+        ${renderSubQsHTML()}
         <div class="form-group" style="margin-bottom:0;">
           <label class="form-label" style="font-size:0.85rem;">章节</label>
           <div class="mb-render-field mb-render-answer mb-click-edit" data-field="chapter_title" data-index="${i}" style="cursor:pointer;min-height:32px;">${chapterHtml ? renderSubSup(chapterHtml) : '<span style="color:var(--text-tertiary);font-style:italic;">点击选择章节...</span>'}</div>
@@ -8541,6 +8807,26 @@ async function handleSubmitBatch() {
       const ch = document.getElementById(`mb-ch-${i}`) || document.getElementById(`batch-ch-${i}`);
       const tg = document.getElementById(`mb-tg-${i}`) || document.getElementById(`batch-tg-${i}`);
       
+      // Read sub-question fields from DOM
+      const subQs = mistakeBatchParsed[i]?.sub_questions || [];
+      const subQuestions = subQs.map((sq, si) => {
+        const sqQ = document.getElementById(`mb-sq-q-${i}-${si}`);
+        const sqCA = document.getElementById(`mb-sq-ca-${i}-${si}`);
+        const sqWA = document.getElementById(`mb-sq-wa-${i}-${si}`);
+        const sqERT = document.getElementById(`mb-sq-ert-${i}-${si}`);
+        const sqER = document.getElementById(`mb-sq-er-${i}-${si}`);
+        const sqTG = document.getElementById(`mb-sq-tg-${i}-${si}`);
+        return {
+          label: sq.label || '',
+          question: sqQ ? sqQ.value.trim() : (sq.question_text || sq.question || ''),
+          correct_answer: sqCA ? sqCA.value.trim() : (sq.correct_answer || ''),
+          wrong_answer: sqWA ? sqWA.value.trim() : (sq.wrong_answer || ''),
+          error_reason: sqER ? sqER.value.trim() : (sq.error_reason || ''),
+          error_reason_type: sqERT ? sqERT.value : (sq.error_reason_type || ''),
+          tags: sqTG ? sqTG.value.trim() : (sq.tags || '')
+        };
+      });
+      
       cardsToSubmit.push({
         question: q ? q.value.trim() : (mistakeBatchParsed[i]?.question || ''),
         correct_answer: ca ? ca.value.trim() : (mistakeBatchParsed[i]?.correct_answer || ''),
@@ -8548,7 +8834,8 @@ async function handleSubmitBatch() {
         error_reason: er ? er.value.trim() : (mistakeBatchParsed[i]?.error_reason || ''),
         error_reason_type: ert ? ert.value : (mistakeBatchParsed[i]?.error_reason_type || ''),
         chapter_title: ch ? ch.value.trim() : (mistakeBatchParsed[i]?.chapter_title || ''),
-        tags: tg ? tg.value.trim() : (mistakeBatchParsed[i]?.tags || '')
+        tags: tg ? tg.value.trim() : (mistakeBatchParsed[i]?.tags || ''),
+        sub_questions: subQuestions
       });
     } else {
       // RENDER MODE: no input elements, read directly from mistakeBatchParsed array
@@ -8560,7 +8847,16 @@ async function handleSubmitBatch() {
         error_reason: card.error_reason || '',
         error_reason_type: card.error_reason_type || '',
         chapter_title: card.chapter_title || '',
-        tags: card.tags || ''
+        tags: card.tags || '',
+        sub_questions: (card.sub_questions || []).map(sq => ({
+          label: sq.label || '',
+          question: (sq.question_text || sq.question || ''),
+          correct_answer: sq.correct_answer || '',
+          wrong_answer: sq.wrong_answer || '',
+          error_reason: sq.error_reason || '',
+          error_reason_type: sq.error_reason_type || '',
+          tags: sq.tags || ''
+        }))
       });
     }
   });
@@ -8574,9 +8870,9 @@ async function handleSubmitBatch() {
   }
   
   // Validate - check if any card has question and correct_answer
-  const validCards = cardsToSubmit.filter(c => c.question && c.question.trim() && c.correct_answer && c.correct_answer.trim());
-  // Check for missing wrong_answer on fill-in-the-blank questions
-  const missingWrongAnswer = cardsToSubmit.filter(c => c.question && c.question.trim() && c.correct_answer && c.correct_answer.trim() && (!c.wrong_answer || !c.wrong_answer.trim()) && (!c.type || c.type === 'fill'));
+  const validCards = cardsToSubmit.filter(c => c.question && c.question.trim() && (c.correct_answer && c.correct_answer.trim() || (c.sub_questions && c.sub_questions.length > 0)));
+  // Check for missing wrong_answer on fill-in-the-blank questions (skip cards with sub_questions - they have their own wrong_answers)
+  const missingWrongAnswer = cardsToSubmit.filter(c => c.question && c.question.trim() && c.correct_answer && c.correct_answer.trim() && (!c.wrong_answer || !c.wrong_answer.trim()) && (!c.type || c.type === 'fill') && (!c.sub_questions || c.sub_questions.length === 0));
   if (missingWrongAnswer.length > 0) {
     showToast(`有 ${missingWrongAnswer.length} 道填空题未填写错误答案，请补充后再提交`);
     // Highlight the cards missing wrong_answer
@@ -8592,7 +8888,15 @@ async function handleSubmitBatch() {
     return;
   }
   // Check for missing error_reason_type (required)
-  const missingERT = validCards.filter(c => !c.error_reason_type || !c.error_reason_type.trim());
+  // For cards with sub_questions, check each sub-question's error_reason_type
+  // For cards without sub_questions, check the parent's error_reason_type
+  const missingERT = validCards.filter(c => {
+    if (c.sub_questions && c.sub_questions.length > 0) {
+      // Sub-question card: check each sub-question
+      return c.sub_questions.some(sq => !sq.error_reason_type || !sq.error_reason_type.trim());
+    }
+    return !c.error_reason_type || !c.error_reason_type.trim();
+  });
   if (missingERT.length > 0) {
     showToast(`有 ${missingERT.length} 题未选择错因类型（知识性错误/概念混淆/方法错误/粗心失误），请补充后再提交`);
     missingERT.forEach((c, ci) => {
@@ -8604,6 +8908,18 @@ async function handleSubmitBatch() {
         setTimeout(() => { cardEl.style.outline = ''; cardEl.style.outlineOffset = ''; }, 3000);
       }
     });
+    return;
+  }
+  // Check for missing wrong_answer on sub-questions
+  const missingSubQWrongAnswer = validCards.filter(c => {
+    if (c.sub_questions && c.sub_questions.length > 0) {
+      return c.sub_questions.some(sq => sq.correct_answer && sq.correct_answer.trim() && (!sq.wrong_answer || !sq.wrong_answer.trim()));
+    }
+    return false;
+  });
+  if (missingSubQWrongAnswer.length > 0) {
+    const totalMissing = missingSubQWrongAnswer.reduce((sum, c) => sum + c.sub_questions.filter(sq => sq.correct_answer && sq.correct_answer.trim() && (!sq.wrong_answer || !sq.wrong_answer.trim())).length, 0);
+    showToast(`有 ${totalMissing} 道子题未填写错误答案，请补充后再提交`);
     return;
   }
   if (validCards.length === 0) {
@@ -8641,7 +8957,7 @@ async function handleSubmitBatch() {
       chapter_id: isMixedMode ? null : parseInt(chapterSelect.value),
       subject_id: isMixedMode ? selectedSubjectId : null,
       tags: '', // no global tags anymore
-      mistakes: validCards.map(c => {
+      mistakes: validCards.flatMap(c => {
         // Handle tags: can be string (from parser) or array (from manual mode)
         let tagsStr = '';
         if (Array.isArray(c.tags)) {
@@ -8650,7 +8966,43 @@ async function handleSubmitBatch() {
           tagsStr = c.tags;
         }
         
-        return {
+        // If card has sub_questions, flatten each sub-question into a separate mistake
+        if (c.sub_questions && c.sub_questions.length > 0) {
+          const parentQuestion = c.question.trim();
+          return c.sub_questions.map(sq => {
+            // Build sub-question tags string
+            let sqTagsStr = '';
+            if (Array.isArray(sq.tags)) {
+              sqTagsStr = sq.tags.join(',');
+            } else if (typeof sq.tags === 'string') {
+              sqTagsStr = sq.tags;
+            }
+            // Merge parent tags with sub-question tags
+            const allTags = [tagsStr, sqTagsStr].filter(t => t && t.trim()).join(',');
+            
+            // question = parent stem + sub-question label + sub-question text
+            const sqLabel = sq.label || '';
+            const sqText = (sq.question_text || sq.question || '').trim();
+            const fullQuestion = parentQuestion + (sqLabel ? ' ' + sqLabel : '') + (sqText ? ' ' + sqText : '');
+            
+            return {
+              question: fullQuestion,
+              correct_answer: (sq.correct_answer || '').trim(),
+              wrong_answer: (sq.wrong_answer || '').trim(),
+              error_reason: (sq.error_reason || '').trim(),
+              error_reason_type: sq.error_reason_type || '',
+              tags: allTags,
+              key_insight: '',
+              question_type: c.type || 'fill',
+              options: [],
+              // For mixed mode, include chapter_title for backend to resolve
+              chapter_title: isMixedMode ? c.chapter_title : null
+            };
+          });
+        }
+        
+        // No sub_questions: submit as a single mistake record
+        return [{
           question: c.question.trim(),
           correct_answer: c.correct_answer.trim(),
           wrong_answer: (c.wrong_answer || '').trim(),
@@ -8662,7 +9014,7 @@ async function handleSubmitBatch() {
           options: c._options || [],
           // For mixed mode, include chapter_title for backend to resolve
           chapter_title: isMixedMode ? c.chapter_title : null
-        };
+        }];
       })
     });
     
